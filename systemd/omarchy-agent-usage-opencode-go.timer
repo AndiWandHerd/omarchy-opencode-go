@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh OpenCode Go usage every 5 minutes
+
+# Wall-clock schedule (not OnBootSec/OnUnitActiveSec): those need a service
+# run as anchor, so after a reboot where the boot trigger was missed the
+# timer sat idle with Trigger: n/a forever. A calendar trigger always
+# re-anchors to wall-clock time and self-heals across reboot and sleep.
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

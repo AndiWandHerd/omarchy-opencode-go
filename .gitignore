@@ -1,0 +1,6 @@
+*.bak
+*~
+.DS_Store
+shell.json.bak*
+__pycache__/
+*.pyc

@@ -1,0 +1,1095 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the OpenCode Go usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+"""Collect OpenCode Go plan usage into one display-ready JSON record.
+
+Everything the agents panel shows for OpenCode Go comes from this one
+command: the authoritative quota windows (rolling 5-hour, weekly, monthly)
+from the official Go usage endpoint, the monthly dollar balance derived from
+them, local token stats for the opencode-go provider from opencode's own
+database, and a desktop notification at most once every 48 hours. The panel
+itself only ever reads the JSON this prints; it never talks to endpoints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "opencode-go"
+AGENT_NAME = "OpenCode Go"
+TIER_LABEL = "Go · $10/mo"
+ENDPOINT = "https://opencode.ai/zen/go/v1/usage"
+PROBE_MIN_INTERVAL_SECONDS = 15
+
+MONTHLY_LIMIT_USD = 60.0
+WEEKLY_LIMIT_USD = 30.0
+ROLLING_LIMIT_USD = 12.0
+
+STRINGS = {
+    "en": {
+        "auth.noKey.status": "API key missing",
+        "auth.noKey.help": (
+            "No OpenCode Go key found. Sign in with opencode, or set OPENCODE_GO_API_KEY; "
+            "the key is read from ~/.local/share/opencode/auth.json."
+        ),
+        "auth.401.status": "Sign-in failed",
+        "auth.401.help": (
+            "The saved OpenCode Go key was rejected (HTTP 401). Re-authenticate opencode; "
+            "this widget picks the new key from ~/.local/share/opencode/auth.json automatically."
+        ),
+        "auth.403.status": "No Go subscription",
+        "auth.403.help": "This key has no OpenCode Go plan (HTTP 403). Showing local token stats only.",
+        "probe.empty.status": "OpenCode Go limits unavailable",
+        "probe.empty.help": "The usage endpoint returned no quota windows. Local token stats are still shown.",
+        "probe.down.status": "OpenCode Go limits unavailable",
+        "probe.down.help": (
+            "Couldn't reach the OpenCode Go usage endpoint. Retrying shortly. "
+            "Local token stats are still shown."
+        ),
+        "probe.429.status": "Rate limited — retrying",
+        "probe.429.help": (
+            "The usage endpoint is rate-limiting checks (HTTP 429). "
+            "Showing last known numbers where available."
+        ),
+        "probe.base.status": "OpenCode Go limits unavailable",
+        "probe.base.help": (
+            "OPENCODE_API_BASE_URL must be an https:// URL — refusing to send the key elsewhere."
+        ),
+        "window.rolling": "Rolling",
+        "window.weekly": "Weekly",
+        "window.monthly": "Monthly",
+        "notify.line": "{short}: ${remaining:.2f} left of ${limit:.0f} · resets in {duration}",
+        "advice.exhausted": "{short} exhausted — resets in {duration}. Prompt cheap until then.",
+        "advice.low": "{short} {percent:.0f}% gone with {duration} left — prompt sparingly.",
+        "advice.overpace": "{short} burns {ratio:.1f}× over even pace — ease off or it caps early.",
+        "advice.opportunity": "{short} holds ${remaining:.2f} with {duration} to go — ~${rate:.2f}/day to use it up.",
+        "advice.healthy": "All windows on track — spend freely.",
+    },
+    "de": {
+        "auth.noKey.status": "API-Key fehlt",
+        "auth.noKey.help": (
+            "Kein OpenCode-Go-Key gefunden. Melde dich mit opencode an oder setze OPENCODE_GO_API_KEY; "
+            "der Key wird aus ~/.local/share/opencode/auth.json gelesen."
+        ),
+        "auth.401.status": "Anmeldung fehlgeschlagen",
+        "auth.401.help": (
+            "Der gespeicherte OpenCode-Go-Key wurde abgewiesen (HTTP 401). Authentifiziere opencode neu; "
+            "das Widget übernimmt den neuen Key automatisch aus ~/.local/share/opencode/auth.json."
+        ),
+        "auth.403.status": "Kein Go-Abo",
+        "auth.403.help": "Dieser Key hat keinen OpenCode-Go-Plan (HTTP 403). Nur lokale Token-Stats werden gezeigt.",
+        "probe.empty.status": "OpenCode-Go-Limits nicht verfügbar",
+        "probe.empty.help": "Der Usage-Endpunkt hat keine Quota-Fenster geliefert. Lokale Token-Stats werden weiterhin gezeigt.",
+        "probe.down.status": "OpenCode-Go-Limits nicht verfügbar",
+        "probe.down.help": (
+            "Der OpenCode-Go-Usage-Endpunkt ist nicht erreichbar. Gleich wird neu versucht. "
+            "Lokale Token-Stats werden weiterhin gezeigt."
+        ),
+        "probe.429.status": "Ratenlimit — neuer Versuch läuft",
+        "probe.429.help": (
+            "Der Usage-Endpunkt drosselt Anfragen (HTTP 429). "
+            "Bekannte Zahlen werden weiter gezeigt."
+        ),
+        "probe.base.status": "OpenCode-Go-Limits nicht verfügbar",
+        "probe.base.help": (
+            "OPENCODE_API_BASE_URL muss eine https://-URL sein — der Key wird nirgendwo anders hingesendet."
+        ),
+        "window.rolling": "Rolling-Fenster",
+        "window.weekly": "Wochenfenster",
+        "window.monthly": "Monatsfenster",
+        "notify.line": "{short}: ${remaining:.2f} übrig von ${limit:.0f} · Reset in {duration}",
+        "advice.exhausted": "{short} erschöpft — Reset in {duration}. Bis dahin günstig prompten.",
+        "advice.low": "{short} zu {percent:.0f}% aufgebraucht, noch {duration} — sparsam prompten.",
+        "advice.overpace": "{short} {ratio:.1f}× über gleichmäßigem Tempo — drosseln oder es cappt früh.",
+        "advice.opportunity": "{short} hält noch ${remaining:.2f} bei {duration} Rest — ~${rate:.2f}/Tag zum Aufbrauchen.",
+        "advice.healthy": "Alle Fenster im Plan — frei verbrauchen.",
+    },
+}
+
+
+def T(lang: str, key: str) -> str:
+    table = STRINGS.get(lang) or {}
+    if key in table:
+        return table[key]
+    return STRINGS["en"].get(key) or key
+
+# The agents panel glyph (BarIconButton text), so the popup carries the mark.
+GLYPH = "󱚣"
+
+# (api key, display title, dollar limit) in panel order.
+WINDOW_ORDER = (
+    ("rolling", "Rolling (5-hour)", ROLLING_LIMIT_USD),
+    ("weekly", "Weekly", WEEKLY_LIMIT_USD),
+    ("monthly", "Monthly", MONTHLY_LIMIT_USD),
+)
+# Nominal window lengths in seconds, for pace math. Monthly is anchored to
+# the billing cycle (~30 days); same assumption the panel's alarm curve uses.
+WINDOW_SPAN_S = {"rolling": 5 * 3600, "weekly": 7 * 86400, "monthly": 30 * 86400}
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+
+
+def cache_root() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def popup_state_path() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy" / "agents"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "opencode-go-popup.json"
+
+
+def date_string(value: dt.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+    today = dt.datetime.now().date()
+    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def local_date_string() -> str:
+    return date_string(dt.datetime.now().date())
+
+
+def number(value: Any) -> int:
+    try:
+        n = float(value or 0)
+        return round(n) if n == n else 0
+    except Exception:
+        return 0
+
+
+def empty_bucket() -> dict[str, int]:
+    return {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    }
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
+    if max_age_seconds <= 0 or not path.exists():
+        return None
+    try:
+        if time.time() - path.stat().st_mtime <= max_age_seconds:
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    # A temp name unique to this writer, not derived from the target: several
+    # collectors can run at once, and a shared temp path means the second
+    # replace finds the first one's file already moved away.
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+        # mkstemp opens at 0600 and it stays that way: probe caches sit next
+        # to auth-adjacent state, so owner-only wins over the stock 0644.
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ------------------------------------------------------------------ auth key
+#
+# The key is read into memory only: it goes nowhere but the Authorization
+# header of the quota probe, and it is never printed, logged, or stored.
+
+
+def api_key() -> str:
+    env = (os.environ.get("OPENCODE_GO_API_KEY") or "").strip()
+    if env:
+        return env
+    auth_path = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "auth.json"
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        for entry in ("opencode-go", "opencode"):
+            node = data.get(entry)
+            if isinstance(node, dict):
+                key = str(node.get("key") or "").strip()
+                if key:
+                    return key
+    # Last resort for setups where other Go tooling already exports it.
+    return (os.environ.get("OPENCODE_API_KEY") or "").strip()
+
+
+# --------------------------------------------------------------------- probe
+
+
+def normalize_reset_at(value: Any, now: dt.datetime) -> str:
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if raw == "":
+        return ""
+    if raw.isdigit():
+        ts = int(raw)
+        if ts < 1e12:
+            ts *= 1000
+        try:
+            return dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).isoformat()
+        except Exception:
+            return raw
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.isoformat()
+    except Exception:
+        return raw
+
+
+def parse_percent(value: Any) -> float:
+    # The endpoint reports USED percent on a 0-100 scale. The panel speaks
+    # fractions, so scale down and clamp.
+    try:
+        n = float(value)
+    except Exception:
+        return -1.0
+    if not (n >= 0):
+        return -1.0
+    return min(1.0, n / 100.0)
+
+
+def parse_windows(payload: dict[str, Any], now: dt.datetime) -> list[dict[str, Any]]:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        # Defensive: accept a legacy shape with the windows at top level.
+        usage = payload
+    out: list[dict[str, Any]] = []
+    for key, title, limit in WINDOW_ORDER:
+        bucket = usage.get(key)
+        if not isinstance(bucket, dict):
+            continue
+        percent = parse_percent(bucket.get("percent"))
+        if percent < 0:
+            continue
+        if bucket.get("resetsAt") is not None:
+            resets_at = normalize_reset_at(bucket.get("resetsAt"), now)
+        elif bucket.get("resetsInSeconds") is not None:
+            try:
+                resets_at = (now + dt.timedelta(seconds=float(bucket.get("resetsInSeconds")))).isoformat()
+            except Exception:
+                resets_at = ""
+        else:
+            resets_at = ""
+        out.append({
+            "label": title,
+            "title": title,
+            "percent": percent,
+            "resetsAt": resets_at,
+            "limit": limit,
+            "key": key,
+            "status": str(bucket.get("status") or ""),
+        })
+    return out
+
+
+def api_base() -> str | None:
+    # Overridable for mirrors/proxies; plain HTTP is refused outright — the
+    # key must never travel unencrypted.
+    base = (os.environ.get("OPENCODE_API_BASE_URL") or "https://opencode.ai").strip().rstrip("/")
+    if not base.lower().startswith("https://"):
+        return None
+    return base
+
+
+def probe_usage(key: str) -> dict[str, Any]:
+    base = api_base()
+    if base is None:
+        return {"ok": False, "refused": True}
+    # The endpoint's front door rejects Python-urllib's default UA (403);
+    # an honest client name passes.
+    request = urllib.request.Request(
+        base + "/zen/go/v1/usage",
+        headers={
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+            "User-Agent": "opencode-go-usage-widget/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as error:
+        return {"ok": False, "http_status": error.code}
+    except Exception:
+        # A transport failure reached no server at all — no route, no DNS. Any
+        # real answer, including an error status, is a server we should stop
+        # pestering; this is not.
+        return {"ok": False, "transport": True}
+    if not isinstance(payload, dict):
+        return {"ok": False, "transport": True}
+    return {"ok": True, "payload": payload}
+
+
+# A cached percentage outlives the probe that measured it, but only until its
+# window rolls over: once a window has reset, the figure describes a period
+# that is over, and a stale number would misreport an allowance that is now
+# untouched.
+def limit_window_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+    raw = str(entry.get("resetsAt") or "")
+    if raw == "":
+        return True
+    try:
+        resets_at = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return True
+    if resets_at.tzinfo is None:
+        resets_at = resets_at.replace(tzinfo=dt.timezone.utc)
+    return resets_at > now
+
+
+def usable_cached_windows(cached: dict[str, Any]) -> list[dict[str, Any]]:
+    # Full window dicts (with limit/status/key) since v0.1.0; older caches
+    # only kept stripped limits, which we enrich best-effort from titles so
+    # a cache hit never degrades balance, advice, popup, or history.
+    entries = cached.get("windows")
+    if not isinstance(entries, list):
+        entries = [enrich_legacy(e) for e in (cached.get("limits") or []) if isinstance(e, dict)]
+    now = dt.datetime.now(dt.timezone.utc)
+    return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+LEGACY_WINDOWS = {
+    "Rolling (5-hour)": ("rolling", ROLLING_LIMIT_USD),
+    "Weekly": ("weekly", WEEKLY_LIMIT_USD),
+    "Monthly": ("monthly", MONTHLY_LIMIT_USD),
+}
+
+
+def enrich_legacy(entry: dict[str, Any]) -> dict[str, Any]:
+    out = dict(entry)
+    key, limit = LEGACY_WINDOWS.get(str(entry.get("title") or ""), ("", 0.0))
+    out.setdefault("key", key)
+    out.setdefault("limit", limit)
+    out.setdefault("status", "")
+    return out
+
+
+def apply_fallback(result: dict[str, Any], fallback: list[dict[str, Any]]) -> None:
+    result["windows"] = fallback
+    result["limits"] = [strip_internal(w) for w in fallback]
+
+
+def strip_internal(entry: dict[str, Any]) -> dict[str, Any]:
+    # "key" stays: the panel maps it to localized display titles (other
+    # collectors' records simply have no key and keep parsed titles).
+    # "limit" stays too: limit rows render remaining dollars from it.
+    return {k: v for k, v in entry.items() if k not in ("status",)}
+
+
+# ------------------------------------------------------- widget settings
+#
+# Single source of truth for collector-side settings is the widget's bar
+# entry in ~/.config/omarchy/shell.json (see the manifest schema; set with
+# `omarchy bar set opencode-go <key> <value>`). Missing file or entry means
+# defaults — the collector also runs fine before the widget is ever placed.
+
+
+def shell_widget_settings() -> dict[str, Any]:
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "omarchy" / "shell.json"
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    try:
+        layout = (data.get("bar") or {}).get("layout") or {}
+        for section in ("left", "center", "right"):
+            entries = layout.get(section) or []
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("id") == AGENT_ID:
+                    return {k: v for k, v in entry.items() if k != "id"}
+    except Exception:
+        pass
+    return {}
+
+
+def resolve_language(settings: dict[str, Any]) -> str:
+    lang = str(settings.get("language") or "auto").lower()
+    if lang in ("en", "de"):
+        return lang
+    sys_lang = (os.environ.get("LANG") or os.environ.get("LANGUAGE") or "en").lower()
+    return "de" if sys_lang.startswith("de") else "en"
+
+
+def collect_limits(key: str, force: bool, lang: str) -> dict[str, Any]:
+    # "limits" is the panel-facing list (no internal fields); "windows" is
+    # the same data with the dollar "limit" attached for the popup lines.
+    result: dict[str, Any] = {"limits": [], "windows": [], "usageStatusText": "", "authHelpText": "", "fetched": False}
+
+    probe_cache = cache_root() / "opencode-go-limits.json"
+    cached = read_fresh_json(probe_cache, float("inf")) or {}
+    fallback = usable_cached_windows(cached)
+
+    if key == "":
+        apply_fallback(result, fallback)
+        result["usageStatusText"] = T(lang, "auth.noKey.status")
+        result["authHelpText"] = T(lang, "auth.noKey.help")
+        return result
+
+    fetched_at = number(cached.get("fetchedAtMs")) / 1000
+    if fallback and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+        apply_fallback(result, fallback)
+        return result
+
+    probe = probe_usage(key)
+    if probe["ok"]:
+        windows = parse_windows(probe["payload"], dt.datetime.now(dt.timezone.utc))
+        if windows:
+            result["windows"] = windows
+            result["limits"] = [strip_internal(w) for w in windows]
+            write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "windows": windows})
+            result["fetched"] = True
+            return result
+        apply_fallback(result, fallback)
+        result["usageStatusText"] = T(lang, "probe.empty.status")
+        result["authHelpText"] = T(lang, "probe.empty.help")
+        return result
+
+    if probe.get("transport"):
+        result["retryAdvised"] = True
+    if fallback:
+        apply_fallback(result, fallback)
+        return result
+    if probe.get("refused"):
+        result["usageStatusText"] = T(lang, "probe.base.status")
+        result["authHelpText"] = T(lang, "probe.base.help")
+        return result
+    status = probe.get("http_status")
+    if status == 401:
+        result["usageStatusText"] = T(lang, "auth.401.status")
+        result["authHelpText"] = T(lang, "auth.401.help")
+    elif status == 403:
+        result["usageStatusText"] = T(lang, "auth.403.status")
+        result["authHelpText"] = T(lang, "auth.403.help")
+    elif status == 429:
+        # Rate-limited checks: ask the panel for a soon retry and keep
+        # whatever the cache still holds (possibly nothing).
+        result["retryAdvised"] = True
+        result["usageStatusText"] = T(lang, "probe.429.status")
+        result["authHelpText"] = T(lang, "probe.429.help")
+    else:
+        result["usageStatusText"] = T(lang, "probe.down.status")
+        result["authHelpText"] = T(lang, "probe.down.help")
+    return result
+
+
+# --------------------------------------------------------------- local stats
+#
+# opencode records per-message provider, model, and token usage in its own
+# database. Scan it read-only for opencode-go provider messages and aggregate
+# exactly the way the stock collectors do. Dollar costs stay out: local cost
+# is unreliable for Go (the server applies model-specific multipliers), so
+# this section carries tokens only.
+
+
+SCAN_ENVELOPE_VERSION = 2
+# Rows created within this band before the watermark are re-read every scan:
+# opencode finalizes a message's tokens in place shortly after creation, so a
+# row first seen mid-stream is corrected (not double-counted) on the next
+# pass via content comparison. 10 minutes is generous; streaming settles in
+# seconds.
+SCAN_OVERLAP_MS = 10 * 60 * 1000
+# Seen-entries older than this are pruned (their aggregates stay merged).
+# Opencode never edits day-old messages, so a later edit of a pruned row
+# would double-count — accepted and documented.
+SEEN_PRUNE_MS = 24 * 3600 * 1000
+
+
+def resolve_opencode_db() -> Path | None:
+    # Explicit override wins (nothing scanned silently elsewhere on typo —
+    # a missing path simply yields no stats, like a missing database).
+    for var in ("OPENCODE_DB", "OPENCODE_DATABASE"):
+        override = (os.environ.get(var) or "").strip()
+        if override:
+            return expand_path(override)
+    root = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode"
+    # Freshest channel database by WAL activity, else the database itself:
+    # channel databases all carry real subscription traffic, and the one
+    # being written to is the one in use. Falls through to opencode.db,
+    # which is also the whole answer on single-channel machines.
+    best: Path | None = None
+    best_key = -1.0
+    candidates = [root / "opencode.db"] + sorted(root.glob("opencode-*.db"))
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        wal = Path(str(cand) + "-wal")
+        try:
+            key = wal.stat().st_mtime if wal.is_file() else cand.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or key > best_key:
+            best, best_key = cand, key
+    return best
+
+
+def scan_cache_path(db: Path) -> Path:
+    return cache_root() / f"go-opencode-{hashlib.sha1(str(db).encode('utf-8')).hexdigest()[:16]}.json"
+
+
+def empty_scan_state() -> dict[str, Any]:
+    return {"byDay": {}, "modelUsage": {}, "totalPrompts": 0,
+            "totalSessions": 0, "allSessions": [], "seen": {},
+            "watermarkMs": 0, "rowCount": 0, "scannedAtMs": 0}
+
+
+def message_key(entry: dict[str, Any], session_id: Any) -> str:
+    # Rows carry no stable message id, so the seen-key is content-derived
+    # from fields that never change on token finalization: same session,
+    # same parent, same creation millisecond, same model. Two distinct
+    # messages colliding on all four is vanishingly unlikely (verified:
+    # 4295/4295 unique on a real database); a collision would mis-merge,
+    # so uniqueness is re-asserted in QA.
+    raw = "\x00".join((str(session_id), str(entry.get("parentID") or ""),
+                        str((entry.get("time") or {}).get("created") or 0),
+                        str(entry.get("modelID") or "")))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def parse_go_row(session_id: Any, raw: Any, today: str) -> tuple | None:
+    # One malformed row must not abort the scan, so every shape assumption
+    # lives inside the try. Returns (key, createdMs, day, model, session,
+    # input, output, cacheRead, cacheWrite, total) or None.
+    try:
+        entry = json.loads(raw)
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+            return None
+        if str(entry.get("providerID") or "") != "opencode-go":
+            return None
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        input_tokens = number(tokens.get("input"))
+        # opencode keeps thinking tokens out of output; both are generated.
+        output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+        cache_read = number(cache.get("read"))
+        cache_write = number(cache.get("write"))
+        total = input_tokens + output_tokens + cache_read + cache_write
+        if total <= 0:
+            return None
+        created = number((entry.get("time") or {}).get("created"))
+        day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
+        model = str(entry.get("modelID") or "go").rstrip("/").split("/")[-1]
+        key = message_key(entry, session_id)
+        return (key, created, day, model, "opencode:" + str(session_id),
+                input_tokens, output_tokens, cache_read, cache_write, total)
+    except Exception:
+        return None
+
+
+def apply_go_row(state: dict[str, Any], sess_set: set[str], parsed: tuple) -> bool:
+    # Merges one parsed row: new rows add, unchanged rows skip, rows whose
+    # tokens were finalized in place get their stale contribution backed out
+    # first (session/day/model never change on finalization, so sets stand).
+    # Returns True when the state changed.
+    key, created, day, model, sess, i, o, r, w, total = parsed
+    seen = state["seen"]
+    old = seen.get(key)
+    if old is not None and (old["i"], old["o"], old["r"], old["w"]) == (i, o, r, w):
+        # Unchanged — still refresh the watermark below via created.
+        if created > state["watermarkMs"]:
+            state["watermarkMs"] = created
+        return False
+    if old is not None:
+        od, om = old["day"], old["model"]
+        d = state["byDay"].get(od)
+        if d is not None:
+            d["tokens"] -= old["i"] + old["o"] + old["r"] + old["w"]
+            d["models"][om] = d["models"].get(om, 0) - (old["i"] + old["o"] + old["r"] + old["w"])
+        b = state["modelUsage"].get(om)
+        if b is not None:
+            b["inputTokens"] -= old["i"]
+            b["outputTokens"] -= old["o"]
+            b["cacheReadInputTokens"] -= old["r"]
+            b["cacheCreationInputTokens"] -= old["w"]
+    else:
+        state["totalPrompts"] += 1
+        if sess not in sess_set:
+            sess_set.add(sess)
+            state["allSessions"].append(sess)
+            state["totalSessions"] += 1
+        d = state["byDay"].setdefault(day, {"tokens": 0, "prompts": 0, "sessions": [], "models": {}})
+        d["prompts"] += 1
+        if sess not in d["sessions"]:
+            d["sessions"].append(sess)
+    d = state["byDay"].setdefault(day, {"tokens": 0, "prompts": 0, "sessions": [], "models": {}})
+    d["tokens"] += total
+    d["models"][model] = d["models"].get(model, 0) + total
+    bucket = state["modelUsage"].setdefault(model, empty_bucket())
+    bucket["inputTokens"] += i
+    bucket["outputTokens"] += o
+    bucket["cacheReadInputTokens"] += r
+    bucket["cacheCreationInputTokens"] += w
+    seen[key] = {"c": created, "day": day, "model": model,
+                 "i": i, "o": o, "r": r, "w": w}
+    if created > state["watermarkMs"]:
+        state["watermarkMs"] = created
+    return True
+
+
+def open_ro_db(db: Path) -> Any:
+    # Read-only: opencode may be writing right now.
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+class _FullRescan(Exception):
+    pass
+
+
+def full_go_scan(db: Path) -> dict[str, Any] | None:
+    # Plain SELECT, no JSON1 needed: the always-correct fallback.
+    state = empty_scan_state()
+    sess_set: set[str] = set()
+    today = local_date_string()
+    try:
+        conn = open_ro_db(db)
+    except sqlite3.Error:
+        return None
+    try:
+        state["rowCount"] = number(conn.execute("SELECT COUNT(*) FROM message").fetchone()[0])
+        for session_id, raw in conn.execute("SELECT session_id, data FROM message"):
+            parsed = parse_go_row(session_id, raw, today)
+            if parsed is not None:
+                apply_go_row(state, sess_set, parsed)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    state["scannedAtMs"] = round(time.time() * 1000)
+    return state
+
+
+def incremental_go_scan(db: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    # Reads only rows near the watermark (plus rows updated since the last
+    # scan, when the schema carries them); anything SQL-side failing falls
+    # back to a full scan via _FullRescan, leaving state untouched.
+    sess_set = set(state.get("allSessions") or [])
+    today = local_date_string()
+    wm = number(state.get("watermarkMs"))
+    since = max(0, wm - SCAN_OVERLAP_MS)
+    updated_cut = max(0, number(state.get("scannedAtMs")) - SCAN_OVERLAP_MS)
+    query = (
+        "SELECT session_id, data FROM message "
+        "WHERE json_valid(data) "
+        "AND data LIKE '%assistant%' AND data LIKE '%opencode-go%' "
+        "AND (coalesce(json_extract(data, '$.time.created'), 0) <= 0 "
+        "OR coalesce(json_extract(data, '$.time.created'), 0) >= ? "
+        "OR coalesce(json_extract(data, '$.time.updated'), 0) >= ?)"
+    )
+    try:
+        conn = open_ro_db(db)
+    except sqlite3.Error:
+        return None
+    try:
+        rowcount = number(conn.execute("SELECT COUNT(*) FROM message").fetchone()[0])
+        if rowcount < number(state.get("rowCount")):
+            # Rows vanished (vacuum/delete): subtraction cannot repair the
+            # merge, so rebuild from scratch.
+            raise _FullRescan()
+        rows = list(conn.execute(query, (since, updated_cut)))
+    except _FullRescan:
+        raise
+    except sqlite3.Error:
+        raise _FullRescan()
+    finally:
+        conn.close()
+    for session_id, raw in rows:
+        parsed = parse_go_row(session_id, raw, today)
+        if parsed is not None:
+            apply_go_row(state, sess_set, parsed)
+    state["rowCount"] = rowcount
+    state["scannedAtMs"] = round(time.time() * 1000)
+    cutoff = state["watermarkMs"] - SEEN_PRUNE_MS
+    for k in [k for k, v in state["seen"].items() if number(v.get("c")) < cutoff]:
+        del state["seen"][k]
+    return state
+
+
+def valid_scan_envelope(env: Any, db: Path) -> dict[str, Any] | None:
+    if not isinstance(env, dict) or env.get("v") != SCAN_ENVELOPE_VERSION:
+        return None
+    if str(env.get("db") or "") != str(db):
+        return None
+    state = env.get("state")
+    if not isinstance(state, dict):
+        return None
+    for k in ("byDay", "modelUsage", "allSessions", "seen"):
+        if state.get(k) is None:
+            return None
+    return state
+
+
+def derive_go_stats(state: dict[str, Any], today: str, recent_dates: list[str]) -> dict[str, Any] | None:
+    if number(state.get("totalPrompts")) <= 0:
+        return None
+    by_day = state.get("byDay") or {}
+    t = by_day.get(today) or {"tokens": 0, "prompts": 0, "sessions": [], "models": {}}
+    return {
+        "todayPrompts": number(t.get("prompts")),
+        "todaySessions": len(t.get("sessions") or []),
+        "todayTotalTokens": number(t.get("tokens")),
+        "todayTokensByModel": dict(t.get("models") or {}),
+        # recentDays.messageCount is actually a token total, despite the
+        # legacy name shared with synced snapshots.
+        "recentDays": [{"date": day, "messageCount": number((by_day.get(day) or {}).get("tokens"))}
+                       for day in recent_dates],
+        "modelUsage": {m: dict(b) for m, b in (state.get("modelUsage") or {}).items()},
+        "totalPrompts": number(state.get("totalPrompts")),
+        "totalSessions": number(state.get("totalSessions")),
+        "activeDays": len(by_day),
+        "activeDates": sorted(by_day),
+    }
+
+
+def scan_go_usage(max_age_seconds: float) -> dict[str, Any] | None:
+    db = resolve_opencode_db()
+    if db is None or not db.is_file():
+        return None
+
+    cache_file = scan_cache_path(db)
+    today = local_date_string()
+    recent_dates = recent_date_strings()
+    force = max_age_seconds <= 0
+
+    if not force:
+        env = read_fresh_json(cache_file, max_age_seconds)
+        state = valid_scan_envelope(env, db)
+        if state is not None:
+            return derive_go_stats(state, today, recent_dates)
+
+    raw_env = read_fresh_json(cache_file, float("inf"))
+    state = None
+    if not force:
+        old = valid_scan_envelope(raw_env, db)
+        if old is not None:
+            try:
+                state = incremental_go_scan(db, old)
+            except _FullRescan:
+                state = None
+    if state is None:
+        state = full_go_scan(db)
+        if state is None:
+            return None
+    stats = derive_go_stats(state, today, recent_dates)
+    write_json(cache_file, {"v": SCAN_ENVELOPE_VERSION, "db": str(db),
+                            "rowCount": number(state.get("rowCount")), "state": state})
+    return stats
+
+
+# -------------------------------------------------------------------- popup
+#
+# At most one desktop notification every 48 hours, carrying the three window
+# figures; clicking it opens the agents panel. The stamp lives next to —
+# never inside — the usage directory, so the panel never parses it as a
+# record.
+
+
+def format_duration(ms: float) -> str:
+    if not (ms > 0):
+        return "now"
+    minutes = int(ms // 60000)
+    hours = minutes // 60
+    days = hours // 24
+    if days > 0:
+        return f"{days}d {hours % 24}h"
+    if hours > 0:
+        return f"{hours}h {minutes % 60}m"
+    return f"{max(1, minutes)}m"
+
+
+def ms_until_reset(resets_at: str, now_ms: float) -> float:
+    try:
+        parsed = dt.datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+    except Exception:
+        return -1
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp() * 1000 - now_ms
+
+
+def notification_binary() -> str | None:
+    found = shutil.which("omarchy-notification-send")
+    if found:
+        return found
+    for candidate in ("/usr/share/omarchy/bin/omarchy-notification-send", "/usr/bin/omarchy-notification-send"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def window_short(lang: str, key: str) -> str:
+    return T(lang, "window." + key)
+
+
+def send_popup(lines: list[str]) -> bool:
+    binary = notification_binary()
+    if binary is None:
+        print("opencode-go: no omarchy-notification-send found; skipping popup", file=sys.stderr)
+        return False
+    argv = [binary, AGENT_NAME, "\n".join(lines), "-g", GLYPH, "-u", "normal",
+            "--exec", "omarchy-shell", "opencode-go", "open"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        print(f"opencode-go: popup failed: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        print(f"opencode-go: popup exited {proc.returncode}: {proc.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def maybe_popup(windows: list[dict[str, Any]], lang: str, interval_seconds: float) -> None:
+    state_path = popup_state_path()
+    try:
+        last_shown = int(json.loads(state_path.read_text(encoding="utf-8")).get("lastShownAtMs") or 0)
+    except Exception:
+        last_shown = 0
+    now_ms = round(time.time() * 1000)
+    if now_ms - last_shown <= interval_seconds * 1000:
+        return
+    lines = []
+    for window in windows:
+        limit = float(window.get("limit") or 0)
+        remaining = (1.0 - float(window.get("percent") or 0)) * limit
+        resets_at = str(window.get("resetsAt") or "")
+        remaining_ms = ms_until_reset(resets_at, now_ms) if resets_at else -1
+        when = format_duration(remaining_ms) if remaining_ms > 0 else "now"
+        lines.append(T(lang, "notify.line").format(
+            short=window_short(lang, str(window.get("key") or "")),
+            remaining=remaining, limit=limit, duration=when))
+    if send_popup(lines):
+        try:
+            write_json(state_path, {"lastShownAtMs": now_ms})
+        except Exception as exc:
+            print(f"opencode-go: could not stamp popup state: {exc}", file=sys.stderr)
+
+
+# -------------------------------------------------------------------- advice
+#
+# One or two behavioral recommendation lines for the panel, derived from the
+# same situation predicates the bar icon and the per-bar tags use. Tones:
+# "bad" (urgent red), "good" (accent teal), "info" (quiet confirmation).
+# Advice is built from fresh probe data only — never from cached fallbacks.
+
+
+def leftover_curve(t: float) -> float:
+    if t >= 1.0:
+        return 1.0
+    if t >= 0.5:
+        return 0.6 + 0.8 * (t - 0.5)
+    if t >= 0.0333:
+        return 0.2 + (0.4 / 0.4667) * (t - 0.0333)
+    if t <= 0.0:
+        return 0.0
+    return 0.2 * (t / 0.0333)
+
+
+def build_advice(windows: list[dict[str, Any]], lang: str) -> list[dict[str, str]]:
+    now_ms = time.time() * 1000
+    cands: list[tuple[int, float, int, str, str]] = []
+    for order, window in enumerate(windows):
+        key = str(window.get("key") or "")
+        if key not in WINDOW_SPAN_S:
+            continue
+        span_ms = WINDOW_SPAN_S[key] * 1000
+        u = float(window.get("percent") or 0)
+        rem_ms = ms_until_reset(str(window.get("resetsAt") or ""), now_ms)
+        t = rem_ms / span_ms if rem_ms > 0 else -1.0
+        elapsed = 1.0 - t if 0.0 < t < 1.0 else -1.0
+        status = str(window.get("status") or "").lower()
+        short = window_short(lang, key)
+        limit = float(window.get("limit") or 0)
+        remaining_usd = (1.0 - u) * limit
+        dur = format_duration(rem_ms) if rem_ms > 0 else "now"
+        if u >= 0.995 or (status and status != "ok"):
+            cands.append((0, -remaining_usd, order, "bad",
+                          T(lang, "advice.exhausted").format(short=short, duration=dur)))
+        elif u >= 0.9:
+            cands.append((1, -remaining_usd, order, "bad",
+                          T(lang, "advice.low").format(short=short, percent=u * 100, duration=dur)))
+        elif elapsed >= 0 and u - elapsed > 0.15:
+            ratio = u / elapsed if elapsed > 0 else 0.0
+            cands.append((2, -remaining_usd, order, "bad",
+                          T(lang, "advice.overpace").format(short=short, ratio=ratio)))
+        elif span_ms >= 7 * 86400 * 1000 and 0.0 < t < 1.0 and (1.0 - u) > leftover_curve(t):
+            days_left = rem_ms / 86400000
+            rate = remaining_usd / days_left if days_left > 0 else remaining_usd
+            cands.append((3, -remaining_usd, order, "good",
+                          T(lang, "advice.opportunity").format(short=short, remaining=remaining_usd, duration=dur,
+                                                              rate=rate)))
+    cands.sort()
+    if not cands:
+        return [{"text": T(lang, "advice.healthy"), "tone": "info"}]
+    return [{"text": text, "tone": tone} for _, _, _, tone, text in cands[:2]]
+
+
+# ------------------------------------------------------------------- history
+#
+# Burn-down fuel: one JSON line per fresh probe with timestamp, used
+# percents, and window resets — the future chart reconstructs billing cycles
+# from the resets fields (the API exposes no history, so sampling starts
+# now). Lives next to the popup state, never inside usage/ (the panel parses
+# every *.json there as an agent record). No pruning: ~150 B/line at
+# 5-minute cadence (~16 MB/year); rotate with tail if it ever matters.
+
+
+def history_path() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy" / "agents"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "opencode-go-history.jsonl"
+
+
+def record_history(windows: list[dict[str, Any]]) -> None:
+    try:
+        entry: dict[str, Any] = {"t": round(time.time() * 1000)}
+        for window in windows:
+            key = str(window.get("key") or "")
+            if key not in ("rolling", "weekly", "monthly"):
+                continue
+            try:
+                pct = int(round(float(window.get("percent") or 0) * 100))
+            except Exception:
+                pct = 0
+            entry[key] = max(0, min(100, pct))
+        if len(entry) <= 1:
+            return
+        path = history_path()
+        # Skip near-duplicates of the previous line (manual re-runs); any
+        # read trouble falls through to appending.
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 512))
+                tail = handle.read() if size > 0 else b""
+            if tail:
+                raw_lines = tail.split(b"\n")
+                last = json.loads(raw_lines[-2 if tail.endswith(b"\n") else -1].decode("utf-8"))
+                same = all(last.get(k) == entry.get(k) for k in ("rolling", "weekly", "monthly") if k in entry)
+                if same and entry["t"] - int(last.get("t") or 0) < 5 * 60 * 1000:
+                    return
+        except Exception:
+            pass
+        resets = {str(w.get("key") or ""): w.get("resetsAt") for w in windows
+                  if str(w.get("key") or "") in ("rolling", "weekly", "monthly") and w.get("resetsAt")}
+        if resets:
+            entry["resets"] = resets
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+        try:
+            if path.stat().st_mode & 0o777 != 0o600:
+                path.chmod(0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"opencode-go: history append failed: {exc}", file=sys.stderr)
+
+
+# -------------------------------------------------------------------- record
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="re-probe the endpoint and rescan the database, ignoring caches")
+    parser.add_argument("--limits-only", action="store_true", help="reuse any recent database scan; only the quota probe must be fresh")
+    parser.add_argument("--cache-seconds", type=float, default=20)
+    args = parser.parse_args()
+
+    scan_age = 0 if args.force else (900 if args.limits_only else args.cache_seconds)
+    stats = scan_go_usage(scan_age)
+
+    key = api_key()
+    settings = shell_widget_settings()
+    lang = resolve_language(settings)
+    limits = collect_limits(key, args.force, lang)
+    if limits.get("fetched"):
+        popup_enabled = str(settings.get("popupEnabled") or "On") != "Off"
+        try:
+            popup_hours = max(1.0, float(settings.get("popupIntervalHours") or 48))
+        except Exception:
+            popup_hours = 48.0
+        # Side effects must never break the record: a popup or history bug
+        # once silenced this whole collector for two days (NameError in the
+        # popup path aborted before printing). Belt and braces.
+        if popup_enabled:
+            try:
+                maybe_popup(limits.get("windows") or [], lang, popup_hours * 3600)
+            except Exception as exc:
+                print(f"opencode-go: popup failed: {exc}", file=sys.stderr)
+        try:
+            record_history(limits.get("windows") or [])
+        except Exception as exc:
+            print(f"opencode-go: history failed: {exc}", file=sys.stderr)
+
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ready": len(limits["limits"]) > 0 or number((stats or {}).get("totalPrompts")) > 0,
+        "hasLocalStats": True,
+        "tierLabel": TIER_LABEL,
+        "usageStatusText": limits["usageStatusText"],
+        "authHelpText": limits["authHelpText"],
+        "limits": limits["limits"],
+    }
+    if limits.get("retryAdvised"):
+        record["retryAdvised"] = True
+
+    monthly = next((w for w in limits.get("windows") or [] if w.get("title") == "Monthly"), None)
+    if monthly is not None:
+        frac = float(monthly.get("percent") or 0)
+        record["balance"] = {
+            "remaining": round((1.0 - frac) * MONTHLY_LIMIT_USD, 2),
+            "funded": MONTHLY_LIMIT_USD,
+            "spent": round(frac * MONTHLY_LIMIT_USD, 2),
+            "currency": "USD",
+            "estimated": True,
+        }
+
+    if stats is not None:
+        record.update(stats)
+    # No behavioral advice on top of an explicit problem state: a cheerful
+    # "all on track" next to "Sign-in failed" would read as broken.
+    if limits["usageStatusText"]:
+        record["advice"] = []
+    else:
+        record["advice"] = build_advice(limits.get("windows") or [], lang)
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

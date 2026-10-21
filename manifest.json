@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "id": "opencode-go",
+  "name": "OpenCode Go",
+  "version": "0.2.0",
+  "author": "Andi Wandherd",
+  "license": "MIT",
+  "description": "OpenCode Go plan quota, pace, and budget advice in a native Omarchy bar panel — an enhanced agents panel with first-class OpenCode Go support.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenCode Go",
+    "description": "One bar icon and one panel: OpenCode Go quota with remaining dollars, reset countdowns, even-pace benchmarks, budget alarms, and behavioral recommendations — plus the classic per-subscription meters.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "providers": {
+        "claude": {
+          "enabled": true
+        },
+        "codex": {
+          "enabled": true
+        },
+        "fireworks": {
+          "enabled": true
+        }
+      },
+      "refreshIntervalSec": 900,
+      "syncMode": "Off",
+      "syncDir": "",
+      "syncFileName": "",
+      "syncDeviceId": "",
+      "language": "auto",
+      "popupEnabled": "On",
+      "popupIntervalHours": 48,
+      "leftoverAlarm": "On",
+      "graduatedColors": "On"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "syncMode",
+        "type": "enum",
+        "label": "Synced aggregation",
+        "options": [
+          "Off",
+          "On"
+        ],
+        "defaultValue": "Off",
+        "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines."
+      },
+      {
+        "key": "syncDir",
+        "type": "path",
+        "label": "Sync folder",
+        "defaultValue": "",
+        "description": "A folder synced by Syncthing, Dropbox, rsync, etc."
+      },
+      {
+        "key": "syncFileName",
+        "type": "string",
+        "label": "Snapshot file name",
+        "defaultValue": "",
+        "description": "Optional. Defaults to <hostname>.json. Use a different file name on each machine, such as laptop.json or desktop.json."
+      },
+      {
+        "key": "syncDeviceId",
+        "type": "string",
+        "label": "Device id",
+        "defaultValue": "",
+        "description": "Optional stable device name used inside synced aggregate snapshots."
+      },
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "options": [
+          "auto",
+          "en",
+          "de"
+        ],
+        "defaultValue": "auto",
+        "description": "Panel and notification language. 'auto' follows the system locale (German if it starts with de, English otherwise)."
+      },
+      {
+        "key": "popupEnabled",
+        "type": "enum",
+        "label": "Usage popup",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On",
+        "description": "When On, a desktop notification with the quota figures appears at most once per popup interval. Clicking it opens the panel."
+      },
+      {
+        "key": "popupIntervalHours",
+        "type": "integer",
+        "label": "Popup interval (hours)",
+        "min": 1,
+        "max": 168,
+        "step": 1,
+        "defaultValue": 48
+      },
+      {
+        "key": "leftoverAlarm",
+        "type": "enum",
+        "label": "Budget-expiry alarm",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On",
+        "description": "When On, the bar icon lights up when a billing window nears its reset while plenty of budget would go to waste."
+      },
+      {
+        "key": "graduatedColors",
+        "type": "enum",
+        "label": "Graduated meter colors",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On",
+        "description": "When On, limit meters warm from foreground through amber tones to urgent red as consumption rises. When Off, meters stay foreground until the alarm line."
+      }
+    ]
+  }
+}

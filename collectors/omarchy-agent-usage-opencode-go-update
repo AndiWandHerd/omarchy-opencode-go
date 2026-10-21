@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# omarchy-agent-usage-opencode-go-update: run the OpenCode Go collector and
+# write its record atomically for the agents panel. Mirrors the validation
+# and atomic-write discipline of the stock omarchy-agent-usage-update
+# collect(): the record must be non-empty and valid JSON before it replaces
+# the live file, so a failed collector run never clobbers good data.
+
+set -euo pipefail
+
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+mkdir -p "$USAGE_DIR"
+
+COLLECTOR="$HOME/.local/bin/omarchy-agent-usage-opencode-go"
+
+record=$("$COLLECTOR") || exit 1
+[[ -n $record ]] || exit 1
+jq -e . >/dev/null 2>&1 <<<"$record" || exit 1
+
+tmp=$(mktemp "$USAGE_DIR/.opencode-go.XXXXXX")
+printf '%s\n' "$record" >"$tmp"
+mv "$tmp" "$USAGE_DIR/opencode-go.json"
