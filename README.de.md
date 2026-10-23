@@ -187,6 +187,12 @@ Upstream den Collector in-tree will, steht in
 
 ## Verwandte Projekte
 
+- [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) —
+  das Schwergewicht: Rust-Binary plus Waybar-/TUI-/Tray-Frontends für 16
+  KI-Provider (inklusive OpenCode Go) mit Schwellen-Notifications. Wer
+  Multi-Provider-Quota in mehreren Desktop-Umgebungen braucht, fängt dort an.
+  Dieses Plugin geht stattdessen in die Tiefe eines Plans: Rest-Dollar,
+  Verfalls-Alarme und Verhaltensempfehlungen speziell für OpenCode Go.
 - [markbus-ai/omarchy-opencode-usage](https://github.com/markbus-ai/omarchy-opencode-usage) —
   das Schwester-Widget für OpenCode-Nutzung in der Omarchy-Bar (Token-Stats
   plus Go-Plan-Meter). Sein inkrementeller Watermark-Scan war Vorbild für

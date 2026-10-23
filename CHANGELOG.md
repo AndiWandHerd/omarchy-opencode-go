@@ -11,6 +11,11 @@ All notable changes to this project are documented here. Format follows
   with stability promise, collector CLI, history format, and panel IPC, so
   external tools (routines, cron jobs, agent hooks) can consume quota data.
 
+### Changed
+- HTTP 429 backoff: a throttling endpoint is left alone for five minutes
+  (server `Retry-After` honored when sane); the last good snapshot keeps
+  showing marked as stale ("next try in Xm") instead of hammering the API.
+
 ## [0.2.0]
 
 ### Added

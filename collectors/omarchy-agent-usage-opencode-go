@@ -34,6 +34,9 @@ AGENT_NAME = "OpenCode Go"
 TIER_LABEL = "Go · $10/mo"
 ENDPOINT = "https://opencode.ai/zen/go/v1/usage"
 PROBE_MIN_INTERVAL_SECONDS = 15
+# A throttling endpoint is left alone this long (server Retry-After wins
+# when sane, see parse_retry_after).
+RATE_LIMIT_BACKOFF_SECONDS = 300
 
 MONTHLY_LIMIT_USD = 60.0
 WEEKLY_LIMIT_USD = 30.0
@@ -65,6 +68,7 @@ STRINGS = {
             "The usage endpoint is rate-limiting checks (HTTP 429). "
             "Showing last known numbers where available."
         ),
+        "probe.429.wait": "Rate limited — next try in {duration}",
         "probe.base.status": "OpenCode Go limits unavailable",
         "probe.base.help": (
             "OPENCODE_API_BASE_URL must be an https:// URL — refusing to send the key elsewhere."
@@ -104,6 +108,7 @@ STRINGS = {
             "Der Usage-Endpunkt drosselt Anfragen (HTTP 429). "
             "Bekannte Zahlen werden weiter gezeigt."
         ),
+        "probe.429.wait": "Ratenlimit — nächster Versuch in {duration}",
         "probe.base.status": "OpenCode-Go-Limits nicht verfügbar",
         "probe.base.help": (
             "OPENCODE_API_BASE_URL muss eine https://-URL sein — der Key wird nirgendwo anders hingesendet."
@@ -320,6 +325,24 @@ def api_base() -> str | None:
     return base
 
 
+def parse_retry_after(headers) -> float | None:
+    # Honor the server's asked wait, clamped to something sane; None means
+    # "no usable hint" and the caller falls back to the default backoff.
+    try:
+        raw = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        secs = float(str(raw).strip())
+    except Exception:
+        return None  # HTTP-date form: not worth parsing, use the default
+    if not (secs > 0):
+        return None
+    return min(secs, 900)
+
+
 def probe_usage(key: str) -> dict[str, Any]:
     base = api_base()
     if base is None:
@@ -338,7 +361,10 @@ def probe_usage(key: str) -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as error:
-        return {"ok": False, "http_status": error.code}
+        result = {"ok": False, "http_status": error.code}
+        if error.code == 429:
+            result["retry_after"] = parse_retry_after(error.headers)
+        return result
     except Exception:
         # A transport failure reached no server at all — no route, no DNS. Any
         # real answer, including an error status, is a server we should stop
@@ -456,18 +482,42 @@ def collect_limits(key: str, force: bool, lang: str) -> dict[str, Any]:
         result["authHelpText"] = T(lang, "auth.noKey.help")
         return result
 
+    now_s = time.time()
+    cooldown_until = number(cached.get("rateLimitedUntilMs")) / 1000
+    if cooldown_until > now_s:
+        # A throttling endpoint is left alone until its cooldown lapses —
+        # the last good snapshot keeps showing (marked by this status).
+        apply_fallback(result, fallback)
+        result["retryAdvised"] = True
+        result["usageStatusText"] = T(lang, "probe.429.wait").format(
+            duration=format_duration((cooldown_until - now_s) * 1000))
+        result["authHelpText"] = T(lang, "probe.429.help")
+        return result
+
     fetched_at = number(cached.get("fetchedAtMs")) / 1000
     if fallback and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
         apply_fallback(result, fallback)
         return result
 
     probe = probe_usage(key)
+    if probe.get("http_status") == 429:
+        # A throttling endpoint is left alone (server's Retry-After when
+        # sane, else the default) regardless of what this run serves —
+        # the fallback return below must not swallow the backoff.
+        wait_s = probe.get("retry_after") or RATE_LIMIT_BACKOFF_SECONDS
+        try:
+            keep = dict(cached)
+            keep["rateLimitedUntilMs"] = round(time.time() * 1000) + int(wait_s * 1000)
+            write_json(probe_cache, keep)
+        except Exception:
+            pass
     if probe["ok"]:
         windows = parse_windows(probe["payload"], dt.datetime.now(dt.timezone.utc))
         if windows:
             result["windows"] = windows
             result["limits"] = [strip_internal(w) for w in windows]
-            write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "windows": windows})
+            write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000),
+                                     "rateLimitedUntilMs": 0, "windows": windows})
             result["fetched"] = True
             return result
         apply_fallback(result, fallback)
@@ -479,6 +529,11 @@ def collect_limits(key: str, force: bool, lang: str) -> dict[str, Any]:
         result["retryAdvised"] = True
     if fallback:
         apply_fallback(result, fallback)
+        if probe.get("http_status") == 429:
+            # Mark the served snapshot as throttled rather than fresh.
+            result["retryAdvised"] = True
+            result["usageStatusText"] = T(lang, "probe.429.status")
+            result["authHelpText"] = T(lang, "probe.429.help")
         return result
     if probe.get("refused"):
         result["usageStatusText"] = T(lang, "probe.base.status")
@@ -492,8 +547,16 @@ def collect_limits(key: str, force: bool, lang: str) -> dict[str, Any]:
         result["usageStatusText"] = T(lang, "auth.403.status")
         result["authHelpText"] = T(lang, "auth.403.help")
     elif status == 429:
-        # Rate-limited checks: ask the panel for a soon retry and keep
-        # whatever the cache still holds (possibly nothing).
+        # Rate-limited checks: back the endpoint off (server's Retry-After
+        # when sane, else the default) and keep whatever the cache still
+        # holds (possibly nothing).
+        wait_s = probe.get("retry_after") or RATE_LIMIT_BACKOFF_SECONDS
+        try:
+            keep = dict(cached)
+            keep["rateLimitedUntilMs"] = round(time.time() * 1000) + int(wait_s * 1000)
+            write_json(probe_cache, keep)
+        except Exception:
+            pass
         result["retryAdvised"] = True
         result["usageStatusText"] = T(lang, "probe.429.status")
         result["authHelpText"] = T(lang, "probe.429.help")

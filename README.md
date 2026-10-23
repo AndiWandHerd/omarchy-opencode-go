@@ -184,6 +184,12 @@ extras). Whether upstream wants the collector in-tree is tracked in
 
 ## Related work
 
+- [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) —
+  the heavyweight: Rust binary plus Waybar/TUI/tray frontends covering 16 AI
+  providers (including OpenCode Go) with threshold notifications. If you need
+  multi-provider quota in several desktop environments, start there. This
+  plugin instead goes deep on one plan: remaining dollars, expiry alarms, and
+  behavioral advice for OpenCode Go specifically.
 - [markbus-ai/omarchy-opencode-usage](https://github.com/markbus-ai/omarchy-opencode-usage) —
   the sibling OpenCode usage widget for the Omarchy bar (token stats plus Go
   plan meters). Its incremental watermark scan inspired our v0.2.0 scan core.
