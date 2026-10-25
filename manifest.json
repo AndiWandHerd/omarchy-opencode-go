@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "opencode-go",
   "name": "OpenCode Go",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Andi Wandherd",
   "license": "MIT",
   "description": "OpenCode Go plan quota, pace, and budget advice in a native Omarchy bar panel — an enhanced agents panel with first-class OpenCode Go support.",

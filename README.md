@@ -39,6 +39,8 @@ and behavioral recommendations — plus token history by day and model.
 - Omarchy 4.x with the shell (`omarchy-shell`)
 - opencode with an active **Go plan** (the key in
   `~/.local/share/opencode/auth.json` is reused — read-only, never printed)
+- `python3` (stdlib only, no packages), `jq`, and a `systemd --user` session
+  for the 5-minute collector timer
 
 ## Install
 

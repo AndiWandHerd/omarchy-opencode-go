@@ -42,6 +42,8 @@ Modell.
 - opencode mit aktivem **Go-Plan** (der Key aus
   `~/.local/share/opencode/auth.json` wird wiederverwendet – nur gelesen,
   nie ausgegeben)
+- `python3` (nur Stdlib, keine Pakete), `jq` und eine `systemd --user`-Session
+  für den 5-Minuten-Collector-Timer
 
 ## Installation
 

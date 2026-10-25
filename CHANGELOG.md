@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0]
 
 ### Added
 - "Machine interface" section in both READMEs: documented record schema
