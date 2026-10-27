@@ -16,6 +16,12 @@ All notable changes to this project are documented here. Format follows
   (server `Retry-After` honored when sane); the last good snapshot keeps
   showing marked as stale ("next try in Xm") instead of hammering the API.
 
+### Fixed
+- Strip the `Authorization` header when a redirect leaves the https origin:
+  Python's default redirect handler would otherwise forward the API key to
+  an http:// destination or a third party (e.g. via a mirror/proxy
+  redirect). Same-origin https redirects keep the header.
+
 ## [0.2.0]
 
 ### Added

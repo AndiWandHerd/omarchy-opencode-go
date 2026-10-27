@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -343,6 +344,23 @@ def parse_retry_after(headers) -> float | None:
     return min(secs, 900)
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    # Python's default redirect handler forwards every header — including
+    # Authorization — to wherever the redirect points, even an http:// URL
+    # or a third party. The key must never travel unencrypted or
+    # cross-origin, so drop it whenever a redirect leaves the https origin.
+    # Same-origin https redirects keep the header (delegated behavior).
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        old = urllib.parse.urlparse(req.full_url)
+        new = urllib.parse.urlparse(new_req.full_url)
+        if (old.scheme, old.hostname, old.port) != (new.scheme, new.hostname, new.port):
+            new_req.remove_header("Authorization")
+        return new_req
+
+
 def probe_usage(key: str) -> dict[str, Any]:
     base = api_base()
     if base is None:
@@ -357,8 +375,9 @@ def probe_usage(key: str) -> dict[str, Any]:
             "User-Agent": "opencode-go-usage-widget/1.0",
         },
     )
+    opener = urllib.request.build_opener(_SafeRedirectHandler)
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with opener.open(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as error:
         result = {"ok": False, "http_status": error.code}
